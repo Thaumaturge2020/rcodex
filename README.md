@@ -452,4 +452,5 @@ local terminal to use local Codex auth and local session storage.
 
 ## License
 
-Choose a license before publishing this repository.
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE)
+for details.
