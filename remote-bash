@@ -1,0 +1,78 @@
+#!/bin/bash
+# rcodex shim: Codex invokes this as `bash`; we forward the command to the
+# remote host over SSH and stream its stdout/stderr/exit code straight back.
+set -euo pipefail
+
+host="${RCODEX_HOST:?rcodex: RCODEX_HOST unset}"
+dir="${RCODEX_DIR:?rcodex: RCODEX_DIR unset}"
+init="${RCODEX_INIT:-}"
+ctl="${RCODEX_SSH_CONTROL_PATH:-}"
+extra="${RCODEX_SSH_EXTRA:-}"
+ssh_command="${RCODEX_SSH_COMMAND:-ssh}"
+controlmaster="${RCODEX_SSH_CONTROLMASTER:-auto}"
+proxy_jump="${RCODEX_SSH_PROXY_JUMP:-}"
+proxy_command="${RCODEX_SSH_PROXY_COMMAND:-}"
+
+# shellcheck disable=SC2206
+ssh_cmd=($ssh_command)
+if [ "${#ssh_cmd[@]}" -eq 0 ]; then
+  ssh_cmd=(ssh)
+fi
+
+ssh_args=()
+if [ "$controlmaster" != "no" ]; then
+  ssh_args+=(-o "ControlMaster=$controlmaster" -o ControlPersist=10m)
+  if [ -n "$ctl" ]; then
+    ssh_args+=(-o "ControlPath=$ctl")
+  fi
+fi
+if [ -n "$proxy_jump" ]; then
+  ssh_args+=(-J "$proxy_jump")
+fi
+if [ -n "$proxy_command" ]; then
+  ssh_args+=(-o "ProxyCommand=$proxy_command")
+fi
+if [ -n "$extra" ]; then
+  # Keep this simple on purpose. Put complex SSH settings in ~/.ssh/config.
+  # shellcheck disable=SC2206
+  extra_args=($extra)
+  ssh_args+=("${extra_args[@]}")
+elif [ -n "${RCODEX_SSH_OPTS:-}" ]; then
+  # Backward compatibility with older rcodex launchers.
+  # shellcheck disable=SC2206
+  legacy_args=(${RCODEX_SSH_OPTS:-})
+  ssh_args=("${legacy_args[@]}")
+fi
+
+# Pull the command string out of typical `bash -lc "..."` / `sh -c "..."` argv.
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --)   shift; break ;;
+    --*)  shift ;;
+    -*c*) shift; cmd="${1:-}"; break ;;   # -c, -lc, -ic ...
+    -*)   shift ;;
+    *)    cmd="$1"; break ;;
+  esac
+done
+
+dir_b64=$(printf '%s' "$dir" | base64 | tr -d '\n')
+remote_prefix='if printf dA== | base64 -d >/dev/null 2>&1; then b64d="base64 -d"; else b64d="base64 -D"; fi'
+
+# Windows executables launched from WSL cannot use an sshfs/FUSE directory as
+# their process cwd. The remote command explicitly cds into RCODEX_DIR, so the
+# local cwd is irrelevant for transport.
+case "${ssh_cmd[0]}" in
+  *.exe|/mnt/*) cd "${RCODEX_LOCAL_EXEC_CWD:-$HOME}" 2>/dev/null || true ;;
+esac
+
+# No command -> interactive remote shell.
+if [ -z "$cmd" ]; then
+  exec "${ssh_cmd[@]}" -t "${ssh_args[@]}" "$host" "$remote_prefix; d=\$(printf %s $dir_b64 | \$b64d); cd \"\$d\" && exec bash -l"
+fi
+
+# Prepend RCODEX_INIT (e.g. conda activate), then run under a remote login shell.
+# Base64 the payload so arbitrary quoting/newlines survive transport untouched.
+full="${init:+$init; }$cmd"
+cmd_b64=$(printf '%s' "$full" | base64 | tr -d '\n')
+exec "${ssh_cmd[@]}" "${ssh_args[@]}" "$host" "$remote_prefix; d=\$(printf %s $dir_b64 | \$b64d); c=\$(printf %s $cmd_b64 | \$b64d); cd \"\$d\" && bash -lc \"\$c\""

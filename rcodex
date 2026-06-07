@@ -1,0 +1,254 @@
+#!/bin/bash
+set -euo pipefail
+
+LAUNCH_DIR="$(pwd -P)"
+GLOBAL_STATE="${RCODEX_GLOBAL_STATE:-$HOME/.rcodex}"
+PROJECT_STATE="${RCODEX_STATE_DIR:-$LAUNCH_DIR/.rcodex}"
+if [ -n "${RCODEX_CONFIG:-}" ]; then
+  CONF="$RCODEX_CONFIG"
+elif [ -f "$PROJECT_STATE/config.sh" ]; then
+  CONF="$PROJECT_STATE/config.sh"
+else
+  CONF="$GLOBAL_STATE/config.sh"
+fi
+[ -f "$CONF" ] || { echo "rcodex: missing config $CONF (copy config.example.sh there)"; exit 1; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+: "${REMOTE_HOST:?set REMOTE_HOST in $CONF}"
+: "${REMOTE_DIR:?set REMOTE_DIR in $CONF}"
+: "${LOCAL_MOUNT:?set LOCAL_MOUNT in $CONF}"
+RCODEX_INIT="${RCODEX_INIT:-}"
+RCODEX_SSH_EXTRA="${RCODEX_SSH_EXTRA:-}"
+RCODEX_SSH_COMMAND="${RCODEX_SSH_COMMAND:-ssh}"
+RCODEX_SSH_PROXY_JUMP="${RCODEX_SSH_PROXY_JUMP:-}"
+RCODEX_SSH_PROXY_COMMAND="${RCODEX_SSH_PROXY_COMMAND:-}"
+
+mkdir -p "$GLOBAL_STATE" "$PROJECT_STATE"
+safe=$(printf '%s' "$REMOTE_HOST" | tr -c 'A-Za-z0-9_.-' '_')
+CTL="$GLOBAL_STATE/cm-$safe.sock"
+
+# shellcheck disable=SC2206
+SSH_CMD=($RCODEX_SSH_COMMAND)
+if [ "${#SSH_CMD[@]}" -eq 0 ]; then
+  SSH_CMD=(ssh)
+fi
+if [ -z "${RCODEX_SSH_CONTROLMASTER+x}" ]; then
+  case "${SSH_CMD[0]}" in
+    ssh|*/ssh) RCODEX_SSH_CONTROLMASTER="auto" ;;
+    *) RCODEX_SSH_CONTROLMASTER="no" ;;
+  esac
+fi
+
+SSH_ARGS=()
+if [ "$RCODEX_SSH_CONTROLMASTER" != "no" ]; then
+  SSH_ARGS+=(-o "ControlMaster=$RCODEX_SSH_CONTROLMASTER" -o "ControlPath=$CTL" -o ControlPersist=10m)
+fi
+if [ -n "$RCODEX_SSH_PROXY_JUMP" ]; then
+  SSH_ARGS+=(-J "$RCODEX_SSH_PROXY_JUMP")
+fi
+if [ -n "$RCODEX_SSH_PROXY_COMMAND" ]; then
+  SSH_ARGS+=(-o "ProxyCommand=$RCODEX_SSH_PROXY_COMMAND")
+fi
+EXTRA_ARGS=()
+if [ -n "$RCODEX_SSH_EXTRA" ]; then
+  # Keep this simple on purpose. Put complex SSH settings in ~/.ssh/config.
+  # shellcheck disable=SC2206
+  EXTRA_ARGS=($RCODEX_SSH_EXTRA)
+  SSH_ARGS+=("${EXTRA_ARGS[@]}")
+fi
+
+ssh_run() { "${SSH_CMD[@]}" "${SSH_ARGS[@]}" "$@"; }
+ssh_control_enabled() { [ "$RCODEX_SSH_CONTROLMASTER" != "no" ]; }
+
+sshfs_args=()
+if [ "${SSH_CMD[*]}" != "ssh" ]; then
+  sshfs_args+=(-o "ssh_command=${SSH_CMD[*]}")
+fi
+if ssh_control_enabled; then
+  sshfs_args+=(-o "ControlMaster=$RCODEX_SSH_CONTROLMASTER" -o "ControlPath=$CTL" -o ControlPersist=10m)
+fi
+if [ -n "$RCODEX_SSH_PROXY_JUMP" ]; then
+  sshfs_args+=(-o "ProxyJump=$RCODEX_SSH_PROXY_JUMP")
+fi
+if [ -n "$RCODEX_SSH_PROXY_COMMAND" ]; then
+  sshfs_args+=(-o "ProxyCommand=$RCODEX_SSH_PROXY_COMMAND")
+fi
+sshfs_args+=("${EXTRA_ARGS[@]}")
+
+SELF="$(cd "$(dirname "$0")" && pwd)"
+SHIM_SRC="$SELF/remote-bash"
+[ -x "$SHIM_SRC" ] || { echo "rcodex: cannot find executable remote-bash next to launcher"; exit 1; }
+
+is_mounted() {
+  if command -v mountpoint >/dev/null 2>&1; then
+    mountpoint -q "$LOCAL_MOUNT"
+  elif command -v findmnt >/dev/null 2>&1; then
+    findmnt -rn --mountpoint "$LOCAL_MOUNT" >/dev/null 2>&1
+  else
+    mount 2>/dev/null | grep -Fq " on $LOCAL_MOUNT "
+  fi
+}
+
+master_up() {
+  ssh_control_enabled || return 1
+  ssh_run -O check "$REMOTE_HOST" >/dev/null 2>&1
+}
+
+ensure_master() {
+  ssh_control_enabled || return 0
+  if master_up; then return 0; fi
+  ssh_run -fN "$REMOTE_HOST" || {
+    echo "rcodex: cannot establish SSH master to $REMOTE_HOST" >&2
+    return 1
+  }
+}
+
+ensure_mount() {
+  if is_mounted; then return 0; fi
+  command -v sshfs >/dev/null || { echo "rcodex: sshfs not installed"; exit 1; }
+  mkdir -p "$LOCAL_MOUNT"
+  sshfs "$REMOTE_HOST:$REMOTE_DIR" "$LOCAL_MOUNT" \
+    -o reconnect -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -o follow_symlinks "${sshfs_args[@]}"
+}
+
+umount_all() {
+  if is_mounted; then
+    fusermount -u "$LOCAL_MOUNT" 2>/dev/null || umount "$LOCAL_MOUNT" 2>/dev/null || true
+  fi
+  if ssh_control_enabled; then
+    ssh_run -O exit "$REMOTE_HOST" 2>/dev/null || true
+  fi
+  echo "rcodex: unmounted and closed SSH master"
+}
+
+setup_shim() {
+  local d="$GLOBAL_STATE/shim"
+  mkdir -p "$d"
+  ln -sf "$SHIM_SRC" "$d/bash"
+  ln -sf "$SHIM_SRC" "$d/sh"
+  printf '%s' "$d"
+}
+
+setup_codex_home() {
+  CH="${RCODEX_CODEX_HOME:-$PROJECT_STATE/codex-home}"
+  mkdir -p "$CH"
+  if [ -e "$HOME/.codex/auth.json" ]; then
+    ln -sf "$HOME/.codex/auth.json" "$CH/auth.json"
+  fi
+  if [ ! -f "$CH/config.toml" ]; then
+    cat > "$CH/config.toml" <<'TOML'
+# rcodex keeps Codex auth, sessions, and logs local in this CODEX_HOME.
+# Project files are seen through sshfs, and shell commands are forwarded by
+# the bash/sh shim to the remote host.
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+cli_auth_credentials_store = "auto"
+TOML
+  fi
+  grep -Eq '^[[:space:]]*sandbox_mode[[:space:]]*=' "$CH/config.toml" || \
+    printf '%s\n' 'sandbox_mode = "danger-full-access"' >> "$CH/config.toml"
+  grep -Eq '^[[:space:]]*approval_policy[[:space:]]*=' "$CH/config.toml" || \
+    printf '%s\n' 'approval_policy = "never"' >> "$CH/config.toml"
+  grep -Eq '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=' "$CH/config.toml" || \
+    printf '%s\n' 'cli_auth_credentials_store = "auto"' >> "$CH/config.toml"
+  export CODEX_HOME="$CH"
+}
+
+export_remote_env() {
+  export RCODEX_HOST="$REMOTE_HOST"
+  export RCODEX_DIR="$REMOTE_DIR"
+  export RCODEX_INIT
+  export RCODEX_SSH_CONTROL_PATH="$CTL"
+  export RCODEX_SSH_EXTRA
+  export RCODEX_SSH_COMMAND
+  export RCODEX_SSH_CONTROLMASTER
+  export RCODEX_SSH_PROXY_JUMP
+  export RCODEX_SSH_PROXY_COMMAND
+}
+
+doctor() {
+  local ok=1
+  local remote_prefix='if printf dA== | base64 -d >/dev/null 2>&1; then b64d="base64 -d"; else b64d="base64 -D"; fi'
+  echo "rcodex doctor"
+  echo "launch: $LAUNCH_DIR"
+  echo "config: $CONF"
+  echo "state:  $PROJECT_STATE"
+  echo "remote: $REMOTE_HOST:$REMOTE_DIR"
+  echo "mount:  $LOCAL_MOUNT"
+  echo "ssh:    ${SSH_CMD[*]}"
+  [ -n "$RCODEX_SSH_PROXY_JUMP" ] && echo "jump:   $RCODEX_SSH_PROXY_JUMP"
+  [ -n "$RCODEX_SSH_PROXY_COMMAND" ] && echo "proxy:  $RCODEX_SSH_PROXY_COMMAND"
+
+  if command -v "${SSH_CMD[0]}" >/dev/null 2>&1 || [ -x "${SSH_CMD[0]}" ]; then
+    echo "ok:     ssh command (${SSH_CMD[*]})"
+  else
+    echo "missing: ssh command ${SSH_CMD[0]}"
+    ok=0
+  fi
+  for cmd in sshfs codex base64; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "ok:     $cmd ($(command -v "$cmd"))"
+    else
+      echo "missing: $cmd"
+      ok=0
+    fi
+  done
+
+  setup_codex_home
+  echo "codex:  $CODEX_HOME"
+  [ -x "$SHIM_SRC" ] && echo "ok:     remote-bash executable" || { echo "missing: executable remote-bash next to rcodex"; ok=0; }
+  [ -e "$CODEX_HOME/auth.json" ] && echo "ok:     local auth.json linked/found" || echo "note:   no auth.json in $CODEX_HOME; keyring auth may still work, otherwise run CODEX_HOME=$CODEX_HOME codex login"
+
+  if ! command -v "${SSH_CMD[0]}" >/dev/null 2>&1 && [ ! -x "${SSH_CMD[0]}" ]; then
+    echo "fail:   ssh command is required for remote checks"
+    ok=0
+  elif ssh_run "$REMOTE_HOST" 'command -v bash >/dev/null && command -v base64 >/dev/null' >/dev/null 2>&1; then
+    echo "ok:     remote has bash and base64"
+  else
+    echo "fail:   cannot run bash/base64 check on remote"
+    ok=0
+  fi
+
+  local dir_b64
+  dir_b64=$(printf '%s' "$REMOTE_DIR" | base64 | tr -d '\n')
+  if ssh_run "$REMOTE_HOST" "$remote_prefix; d=\$(printf %s $dir_b64 | \$b64d); [ -d \"\$d\" ]" >/dev/null 2>&1; then
+    echo "ok:     remote directory exists"
+  else
+    echo "fail:   remote directory does not exist or is not accessible"
+    ok=0
+  fi
+
+  is_mounted && echo "ok:     mounted" || echo "note:   not mounted"
+  [ "$ok" -eq 1 ]
+}
+
+case "${1:-}" in
+  --umount|--stop) umount_all; exit 0 ;;
+  --mount) ensure_master; ensure_mount; echo "rcodex: mounted $REMOTE_HOST:$REMOTE_DIR -> $LOCAL_MOUNT"; exit 0 ;;
+  --doctor) doctor; exit $? ;;
+  --status)
+    is_mounted && echo "mount:  UP ($LOCAL_MOUNT)" || echo "mount:  down"
+    if ssh_control_enabled; then
+      ssh_run -O check "$REMOTE_HOST" 2>&1 | sed 's/^/master: /' || true
+    else
+      echo "master: disabled"
+    fi
+    exit 0 ;;
+esac
+
+ensure_master
+ensure_mount
+setup_codex_home
+export_remote_env
+
+shimdir="$(setup_shim)"
+cd "$LOCAL_MOUNT"
+export PATH="$shimdir:$PATH"
+if [ "${1:-}" = "--shell" ]; then
+  shift
+  exec "$SHIM_SRC" "$@"
+fi
+command -v codex >/dev/null || { echo "rcodex: codex not found in PATH"; exit 1; }
+exec codex "$@"
