@@ -23,6 +23,7 @@ RCODEX_SSH_EXTRA="${RCODEX_SSH_EXTRA:-}"
 RCODEX_SSH_COMMAND="${RCODEX_SSH_COMMAND:-ssh}"
 RCODEX_SSH_PROXY_JUMP="${RCODEX_SSH_PROXY_JUMP:-}"
 RCODEX_SSH_PROXY_COMMAND="${RCODEX_SSH_PROXY_COMMAND:-}"
+RCODEX_REMOTE_CODEX_HOME="${RCODEX_REMOTE_CODEX_HOME:-~/.codex}"
 
 mkdir -p "$GLOBAL_STATE" "$PROJECT_STATE"
 safe=$(printf '%s' "$REMOTE_HOST" | tr -c 'A-Za-z0-9_.-' '_')
@@ -224,7 +225,308 @@ doctor() {
   [ "$ok" -eq 1 ]
 }
 
+count_session_files() {
+  local d="$1"
+  if [ -d "$d" ]; then
+    find "$d" -type f -name '*.jsonl' | wc -l | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
+sanitize_session_jsonl() {
+  local root="$1"
+  local sanitized_count=0
+  local changed
+
+  [ -d "$root" ] || return 0
+  while IFS= read -r -d '' f; do
+    changed=$(perl -MJSON::PP -e '
+      use strict;
+      use warnings;
+
+      sub looks_opaque {
+        my ($s) = @_;
+        return defined($s) && length($s) >= 80 && $s =~ /\A[A-Za-z0-9+\/=_-]+\z/;
+      }
+
+      sub rewrite_paths {
+        my ($value, $key) = @_;
+        my $remote = $ENV{RCODEX_SYNC_REMOTE_DIR} // "";
+        my $local = $ENV{RCODEX_SYNC_LOCAL_MOUNT} // "";
+        my $changed = 0;
+
+        if (ref($value) eq "HASH") {
+          for my $child_key (keys %$value) {
+            my $child = $value->{$child_key};
+            if (ref($child)) {
+              $changed += rewrite_paths($child, $child_key);
+            } elsif (defined($child) && $remote ne "" && index($child, $remote) >= 0) {
+              next if $child_key eq "encrypted_content" && looks_opaque($child);
+              $child =~ s/\Q$remote\E/$local/g;
+              $value->{$child_key} = $child;
+              $changed++;
+            }
+          }
+        } elsif (ref($value) eq "ARRAY") {
+          for my $idx (0 .. $#$value) {
+            my $child = $value->[$idx];
+            if (ref($child)) {
+              $changed += rewrite_paths($child, $key);
+            } elsif (defined($child) && $remote ne "" && index($child, $remote) >= 0) {
+              $child =~ s/\Q$remote\E/$local/g;
+              $value->[$idx] = $child;
+              $changed++;
+            }
+          }
+        }
+
+        return $changed;
+      }
+
+      my $file = shift @ARGV;
+      my $json = JSON::PP->new->utf8;
+      open my $in, "<:raw", $file or die "open $file: $!";
+      my @out;
+      my $changed = 0;
+
+      while (defined(my $line = <$in>)) {
+        my $orig = $line;
+        $line =~ s/\r?\n\z//;
+        my $obj = eval { $json->decode($line) };
+        if ($@ || ref($obj) ne "HASH") {
+          push @out, $orig;
+          next;
+        }
+
+        my $line_changed = rewrite_paths($obj, undef);
+        if (($obj->{type} // "") eq "compacted") {
+          my $payload = $obj->{payload};
+          my $history = ref($payload) eq "HASH" ? $payload->{replacement_history} : undef;
+          if (ref($history) eq "ARRAY") {
+            for my $item (@$history) {
+              next unless ref($item) eq "HASH";
+              next unless ($item->{type} // "") eq "compaction";
+              next unless exists $item->{encrypted_content};
+              my $content = defined($item->{encrypted_content}) ? $item->{encrypted_content} : "";
+              next if looks_opaque($content);
+              %$item = (
+                type => "message",
+                role => "user",
+                content => [{
+                  type => "input_text",
+                  text => "Imported Codex compaction summary from a migrated session:\n\n$content",
+                }],
+              );
+              $line_changed = 1;
+              $changed++;
+            }
+          }
+        }
+
+        push @out, $line_changed ? $json->encode($obj) . "\n" : $orig;
+      }
+      close $in;
+
+      if ($changed) {
+        open my $out, ">:raw", $file or die "write $file: $!";
+        print {$out} @out;
+        close $out;
+      }
+      print "$changed\n";
+    ' "$f")
+    sanitized_count=$((sanitized_count + changed))
+  done < <(find "$root" -type f -name '*.jsonl' -print0)
+
+  if [ "$sanitized_count" -gt 0 ]; then
+    echo "rcodex sync: normalized $sanitized_count plaintext compaction item(s)"
+  fi
+}
+
+print_sync_help() {
+  cat <<'EOF'
+rcodex sync - import remote Codex sessions into the local rcodex CODEX_HOME
+
+Usage:
+  rcodex sync [options]
+
+Options:
+  --from PATH       Remote Codex home to import from (default: ~/.codex)
+  --all             Import all remote sessions instead of filtering by REMOTE_DIR
+  --with-history    Also merge remote history.jsonl into local history.jsonl
+  --dry-run         Show what would be imported without writing local sessions
+  -h, --help        Show this help
+
+Default behavior:
+  - copies remote sessions/ into ./.rcodex/codex-home/sessions
+  - keeps only sessions whose recorded cwd starts with REMOTE_DIR
+  - rewrites REMOTE_DIR in imported rollout files to LOCAL_MOUNT
+  - normalizes plaintext compaction summaries so resumed sessions do not send
+    them as encrypted reasoning content
+  - does not copy remote auth.json, config.toml, sqlite state, or logs
+EOF
+}
+
+sync_sessions() {
+  local remote_home="$RCODEX_REMOTE_CODEX_HOME"
+  local import_all=0
+  local with_history=0
+  local dry_run=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --from|--remote-home)
+        shift
+        remote_home="${1:?rcodex sync: --from requires a remote path}"
+        ;;
+      --all) import_all=1 ;;
+      --with-history) with_history=1 ;;
+      --dry-run) dry_run=1 ;;
+      -h|--help) print_sync_help; return 0 ;;
+      *)
+        echo "rcodex sync: unknown option $1" >&2
+        echo "try: rcodex sync --help" >&2
+        return 2
+        ;;
+    esac
+    shift
+  done
+
+  for cmd in tar perl awk; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+      echo "rcodex sync: missing local dependency: $cmd" >&2
+      return 1
+    }
+  done
+  perl -MJSON::PP -e '1' >/dev/null 2>&1 || {
+    echo "rcodex sync: missing local Perl module: JSON::PP" >&2
+    return 1
+  }
+
+  ensure_master
+  setup_codex_home
+
+  local tmp
+  tmp=$(mktemp -d "$PROJECT_STATE/sync.XXXXXX")
+  trap 'rm -rf "$tmp"' RETURN
+
+  local remote_prefix remote_home_b64 remote_cmd
+  remote_prefix='if printf dA== | base64 -d >/dev/null 2>&1; then b64d="base64 -d"; else b64d="base64 -D"; fi'
+  remote_home_b64=$(printf '%s' "$remote_home" | base64 | tr -d '\n')
+  remote_cmd="$remote_prefix; src=\$(printf %s $remote_home_b64 | \$b64d); if [ \"\$src\" = '~' ]; then src=\$HOME; elif [ \"\${src#\\~/}\" != \"\$src\" ]; then src=\"\$HOME/\${src#\\~/}\"; fi; [ -d \"\$src\" ] || { echo \"rcodex sync: remote Codex home not found: \$src\" >&2; exit 10; }; command -v tar >/dev/null 2>&1 || { echo \"rcodex sync: remote tar not found\" >&2; exit 11; }; cd \"\$src\"; set --; [ -d sessions ] && set -- \"\$@\" sessions; [ -f history.jsonl ] && set -- \"\$@\" history.jsonl; [ \"\$#\" -gt 0 ] || { echo \"rcodex sync: no sessions/history found in \$src\" >&2; exit 12; }; tar -cf - \"\$@\""
+
+  echo "rcodex sync: source $REMOTE_HOST:$remote_home"
+  echo "rcodex sync: target $CODEX_HOME"
+  if [ "$import_all" -eq 0 ]; then
+    echo "rcodex sync: filtering sessions by remote cwd prefix $REMOTE_DIR"
+  else
+    echo "rcodex sync: importing all remote sessions"
+  fi
+
+  if ! ssh_run "$REMOTE_HOST" "$remote_cmd" > "$tmp/remote.tar"; then
+    echo "rcodex sync: failed to read remote Codex sessions" >&2
+    return 1
+  fi
+  if ! tar -xf "$tmp/remote.tar" -C "$tmp"; then
+    echo "rcodex sync: failed to unpack remote Codex sessions" >&2
+    return 1
+  fi
+  rm -f "$tmp/remote.tar"
+
+  local total matched local_mount
+  total=$(count_session_files "$tmp/sessions")
+
+  if [ -d "$tmp/sessions" ] && [ "$import_all" -eq 0 ]; then
+    while IFS= read -r -d '' f; do
+      if ! grep -Fq "\"cwd\":\"$REMOTE_DIR" "$f"; then
+        rm -f "$f"
+      fi
+    done < <(find "$tmp/sessions" -type f -name '*.jsonl' -print0)
+    find "$tmp/sessions" -type d -empty -delete 2>/dev/null || true
+  fi
+
+  matched=$(count_session_files "$tmp/sessions")
+  local_mount="$LOCAL_MOUNT"
+  case "$local_mount" in
+    /*) ;;
+    *) local_mount="$LAUNCH_DIR/$local_mount" ;;
+  esac
+
+  if [ -d "$tmp/sessions" ]; then
+    RCODEX_SYNC_REMOTE_DIR="$REMOTE_DIR" \
+    RCODEX_SYNC_LOCAL_MOUNT="$local_mount" \
+      sanitize_session_jsonl "$tmp/sessions"
+  fi
+
+  echo "rcodex sync: remote session files: $total"
+  echo "rcodex sync: matching session files: $matched"
+
+  if [ "$dry_run" -eq 1 ]; then
+    [ "$with_history" -eq 1 ] && [ -f "$tmp/history.jsonl" ] && \
+      echo "rcodex sync: would merge history.jsonl"
+    echo "rcodex sync: dry run complete"
+    return 0
+  fi
+
+  if [ "$matched" -gt 0 ]; then
+    mkdir -p "$CODEX_HOME/sessions"
+    cp -a "$tmp/sessions/." "$CODEX_HOME/sessions/"
+  fi
+
+  if [ "$with_history" -eq 1 ] && [ -f "$tmp/history.jsonl" ]; then
+    touch "$CODEX_HOME/history.jsonl"
+    local hist_tmp
+    hist_tmp="$tmp/history.jsonl.merged"
+    awk '!seen[$0]++' "$CODEX_HOME/history.jsonl" "$tmp/history.jsonl" > "$hist_tmp"
+    mv "$hist_tmp" "$CODEX_HOME/history.jsonl"
+    echo "rcodex sync: merged history.jsonl"
+  fi
+
+  echo "rcodex sync: import complete"
+}
+
+print_help() {
+  cat <<'EOF'
+rcodex - run Codex locally and execute shell commands on a remote host
+
+Usage:
+  rcodex [codex options] [prompt]
+  rcodex exec [codex exec options] "prompt"
+  rcodex resume [codex resume options]
+
+rcodex commands:
+  --doctor       Check local tools, SSH transport, remote bash/base64, and REMOTE_DIR
+  --mount        Mount REMOTE_HOST:REMOTE_DIR at LOCAL_MOUNT
+  --status       Show mount and SSH master status
+  --shell        Open a raw remote shell in REMOTE_DIR
+  sync           Import remote Codex sessions into local rcodex CODEX_HOME
+  --umount       Unmount LOCAL_MOUNT and close the SSH master when enabled
+  --stop         Alias for --umount
+  -h, --help     Show this help
+
+Permission aliases:
+  --dangerous-access
+      Alias for Codex's --dangerously-bypass-approvals-and-sandbox.
+      rcodex already creates a project-local Codex config with
+      sandbox_mode="danger-full-access" and approval_policy="never".
+
+Pass-through:
+  All other arguments are passed to codex after rcodex mounts the remote
+  directory and sets CODEX_HOME.
+
+Examples:
+  rcodex
+  rcodex "inspect this project"
+  rcodex exec "run the tests"
+  rcodex resume --last
+  rcodex sync
+  rcodex -- --help
+EOF
+}
+
 case "${1:-}" in
+  -h|--help) print_help; exit 0 ;;
+  sync|sync-sessions|import-sessions) shift; sync_sessions "$@"; exit $? ;;
   --umount|--stop) umount_all; exit 0 ;;
   --mount) ensure_master; ensure_mount; echo "rcodex: mounted $REMOTE_HOST:$REMOTE_DIR -> $LOCAL_MOUNT"; exit 0 ;;
   --doctor) doctor; exit $? ;;
@@ -236,6 +538,7 @@ case "${1:-}" in
       echo "master: disabled"
     fi
     exit 0 ;;
+  --) shift ;;
 esac
 
 ensure_master
@@ -251,4 +554,11 @@ if [ "${1:-}" = "--shell" ]; then
   exec "$SHIM_SRC" "$@"
 fi
 command -v codex >/dev/null || { echo "rcodex: codex not found in PATH"; exit 1; }
-exec codex "$@"
+CODEX_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --dangerous-access) CODEX_ARGS+=(--dangerously-bypass-approvals-and-sandbox) ;;
+    *) CODEX_ARGS+=("$arg") ;;
+  esac
+done
+exec codex "${CODEX_ARGS[@]}"

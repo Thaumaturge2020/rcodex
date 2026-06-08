@@ -194,6 +194,8 @@ RCODEX_SSH_CONTROLMASTER="auto"
 RCODEX_SSH_PROXY_JUMP=""
 RCODEX_SSH_PROXY_COMMAND=""
 RCODEX_SSH_EXTRA=""
+
+RCODEX_REMOTE_CODEX_HOME="~/.codex"
 ```
 
 `RCODEX_INIT` is prepended to every remote shell command. Use it for environment
@@ -324,10 +326,30 @@ Start the interactive Codex TUI:
 rcodex
 ```
 
+Show rcodex help:
+
+```bash
+rcodex --help
+```
+
+Show the underlying Codex help:
+
+```bash
+rcodex -- --help
+```
+
 Run non-interactively:
 
 ```bash
 rcodex exec "run the tests and fix the failure"
+```
+
+`rcodex` forwards normal Codex flags and prompts after setting up the remote
+mount. For example:
+
+```bash
+rcodex --model gpt-5.4
+rcodex exec --json "summarize the project"
 ```
 
 Resume:
@@ -336,6 +358,12 @@ Resume:
 rcodex resume
 rcodex resume --last
 rcodex exec resume --last "continue"
+```
+
+Import existing Codex sessions from the remote host:
+
+```bash
+rcodex sync
 ```
 
 Open a raw remote shell for debugging:
@@ -365,6 +393,60 @@ rcodex exec "hostname && nvidia-smi -L"
 ```
 
 The `pwd` printed by the remote shell should be `REMOTE_DIR`.
+
+## Sync Remote Sessions
+
+If you previously ran Codex directly on the remote machine, its conversations
+usually live under the remote user's `~/.codex`. `rcodex sync` imports those
+session rollout files into the local project `CODEX_HOME` so they can be resumed
+through `rcodex`.
+
+Default behavior:
+
+- reads remote `~/.codex`
+- imports `sessions/`
+- keeps only sessions whose recorded `cwd` starts with `REMOTE_DIR`
+- rewrites `REMOTE_DIR` in imported rollout files to `LOCAL_MOUNT`
+- normalizes plaintext compaction summaries from older session rollouts so they
+  are resumed as ordinary context instead of invalid encrypted reasoning content
+- does not copy remote `auth.json`, `config.toml`, sqlite state, logs, or caches
+
+Run:
+
+```bash
+rcodex sync
+rcodex resume --all
+```
+
+Preview first:
+
+```bash
+rcodex sync --dry-run
+```
+
+Import from another remote Codex home:
+
+```bash
+rcodex sync --from ~/.codex.bak.20260524-203937
+```
+
+Import all remote sessions without filtering by `REMOTE_DIR`:
+
+```bash
+rcodex sync --all
+```
+
+Also merge remote prompt history:
+
+```bash
+rcodex sync --with-history
+```
+
+The remote Codex home can also be configured:
+
+```bash
+RCODEX_REMOTE_CODEX_HOME="~/.codex"
+```
 
 ## Example: Compile And Run C++
 
@@ -401,6 +483,11 @@ approval_policy = "never"
 This is intentional: the local Codex sandbox would usually block SSH and sshfs
 network access. In this workflow, the real boundary is the remote SSH account
 and the mounted remote directory.
+
+Because this config is already full-access, running plain `rcodex` starts Codex
+with the permissions needed for the SSH/sshfs workflow. For convenience,
+`rcodex --dangerous-access ...` is accepted as an alias for Codex's current
+`--dangerously-bypass-approvals-and-sandbox` flag.
 
 Use `rcodex` only with trusted repositories and trusted remote hosts.
 

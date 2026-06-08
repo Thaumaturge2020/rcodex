@@ -32,3 +32,6 @@ RCODEX_SSH_PROXY_COMMAND=""
 # Extra ssh/sshfs options if needed. Keep this simple; put complex settings
 # (ProxyJump, quoted paths, multiple identities, etc.) in ~/.ssh/config.
 RCODEX_SSH_EXTRA=""            # e.g. "-o IdentitiesOnly=yes"
+
+# Remote Codex home used by `rcodex sync`.
+RCODEX_REMOTE_CODEX_HOME="~/.codex"
